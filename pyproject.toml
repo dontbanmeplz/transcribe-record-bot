@@ -1,0 +1,13 @@
+[project]
+name = "voicerecorder"
+version = "0.1.0"
+description = "Discord stage transcription and summarization bot using discord.py, Whisper, and AWS Bedrock"
+requires-python = ">=3.11"
+dependencies = [
+    "discord.py[voice]>=2.7.1",
+    "discord-ext-voice-recv @ git+https://github.com/rdphillips7/discord-ext-voice-recv@main",
+    "faster-whisper>=1.1.0",
+    "boto3>=1.34.0",
+    "python-dotenv>=1.0.0",
+    "numpy>=1.24.0",
+]
