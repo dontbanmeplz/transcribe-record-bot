@@ -1,12 +1,15 @@
 """
-Monkey-patch for discord-ext-voice-recv to handle DAVE decryption failures.
+Monkey-patch for discord-ext-voice-recv to harden the audio receive pipeline.
 
-The rdphillips7 fork's PacketDecoder._process_packet() crashes the entire
-audio receive pipeline when a DAVE decrypt fails (e.g., during the DAVE
-handshake transition period where some packets arrive unencrypted).
+Wraps PacketDecoder._process_packet() to catch two classes of errors that
+otherwise crash the PacketRouter thread and kill all audio reception:
 
-This patch wraps the decrypt call in a try/except so failed packets are
-dropped instead of crashing the PacketRouter thread.
+1. DAVE decrypt failures (ValueError) — during DAVE handshake transitions,
+   some packets arrive unencrypted or with stale epoch keys.
+2. Opus decode failures (OpusError: corrupted stream) — when DAVE decryption
+   produces garbage data, the Opus decoder raises on the corrupted payload.
+
+Both are caught and the offending packet is dropped so the router continues.
 
 See: https://github.com/imayhaveborkedit/discord-ext-voice-recv/pull/56
 """
@@ -17,13 +20,19 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Counters for throttled logging
+_dave_fail_count: int = 0
+_opus_fail_count: int = 0
+
 
 def apply() -> None:
-    """Apply the DAVE decrypt safety patch to voice-recv's PacketDecoder."""
+    """Apply safety patches to voice-recv's PacketDecoder."""
+    global _dave_fail_count, _opus_fail_count
+
     try:
         from discord.ext.voice_recv.opus import PacketDecoder, VoiceData
     except ImportError:
-        logger.warning("Could not import voice_recv.opus — DAVE patch not applied")
+        logger.warning("Could not import voice_recv.opus — patch not applied")
         return
 
     try:
@@ -38,16 +47,13 @@ def apply() -> None:
 
     log = logging.getLogger("discord.ext.voice_recv.opus")
 
-    # Save original method
-    _original_process_packet = PacketDecoder._process_packet
-
     def _patched_process_packet(self, packet):
         """
-        Patched _process_packet that catches DAVE decrypt failures.
-
-        When decrypt fails (e.g., UnencryptedWhenPassthroughDisabled),
-        the packet is dropped instead of crashing the PacketRouter.
+        Patched _process_packet that catches DAVE decrypt failures
+        and Opus decode errors so the PacketRouter stays alive.
         """
+        global _dave_fail_count, _opus_fail_count
+
         pcm = None
         member = self._get_cached_member()
 
@@ -58,6 +64,7 @@ def apply() -> None:
             self._cached_id = self.sink.voice_client._get_id_from_ssrc(self.ssrc)  # type: ignore
             member = self._get_cached_member()
 
+        # --- DAVE inner decryption ---
         if (
             has_dave
             and not packet.is_silence()
@@ -66,7 +73,6 @@ def apply() -> None:
             and self.vc._connection.dave_session.ready
         ):
             if member is None:
-                # Can't decrypt without a user ID — drop packet
                 return None
 
             try:
@@ -76,21 +82,28 @@ def apply() -> None:
                     bytes(packet.decrypted_data),
                 )
             except (ValueError, Exception) as e:
-                # Log first occurrence, then throttle
-                _patched_process_packet._fail_count = getattr(
-                    _patched_process_packet, "_fail_count", 0
-                ) + 1
-                count = _patched_process_packet._fail_count
-                if count in (1, 10, 50, 200) or count % 500 == 0:
+                _dave_fail_count += 1
+                if _dave_fail_count in (1, 10, 50, 200) or _dave_fail_count % 500 == 0:
                     log.warning(
                         "DAVE decrypt failed (count=%d), dropping packet: %s",
-                        count,
+                        _dave_fail_count,
                         e,
                     )
                 return None
 
+        # --- Opus decode ---
         if not self.sink.wants_opus():
-            packet, pcm = self._decode_packet(packet)
+            try:
+                packet, pcm = self._decode_packet(packet)
+            except Exception as e:
+                _opus_fail_count += 1
+                if _opus_fail_count in (1, 10, 50, 200) or _opus_fail_count % 500 == 0:
+                    log.warning(
+                        "Opus decode failed (count=%d), dropping packet: %s",
+                        _opus_fail_count,
+                        e,
+                    )
+                return None
 
         data = VoiceData(packet, member, pcm=pcm)
         self._last_seq = packet.sequence
@@ -99,4 +112,4 @@ def apply() -> None:
         return data
 
     PacketDecoder._process_packet = _patched_process_packet
-    logger.info("Applied DAVE decrypt safety patch to PacketDecoder._process_packet")
+    logger.info("Applied DAVE + Opus safety patch to PacketDecoder._process_packet")
