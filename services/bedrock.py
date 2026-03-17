@@ -32,9 +32,9 @@ Use clear, professional language. Be concise but don't omit important details.\
 
 ASK_SYSTEM_PROMPT = """\
 You are a helpful assistant with access to a transcript from a Discord stage \
-channel session. Answer the user's question based ONLY on information found \
-in the transcript. If the answer is not in the transcript, say so clearly. \
-When referencing what someone said, attribute it to them by name.\
+channel session. \
+Answer questions however the user wants. \
+Dont limit yourself to the transcript. \
 """
 
 
